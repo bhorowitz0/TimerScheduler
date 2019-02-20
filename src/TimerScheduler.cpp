@@ -1,5 +1,5 @@
 /**
- * MIT License
+ * The MIT License (MIT)
  *
  * Copyright (c) 2019 Ben Horowitz
  *
@@ -18,19 +18,17 @@
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
  * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
  */
 #include "TimerScheduler.h"
-#include "SpinLock.h"
 
 #include <chrono>
 #include <functional>
 #include <thread>
-#include <atomic>
 #include <condition_variable>
-#include <cstdint>
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 
@@ -38,54 +36,92 @@ class TimerSchedulerImpl
 {
 public:
     TimerSchedulerImpl() = delete;
+    TimerSchedulerImpl(const TimerSchedulerImpl&) = delete;
+    TimerSchedulerImpl& operator=(const TimerSchedulerImpl &) = delete;
+    TimerSchedulerImpl(TimerSchedulerImpl &&) = delete;
+    TimerSchedulerImpl & operator=(TimerSchedulerImpl &&) = delete;
 
-    static inline void start()
+    static inline void reserve(size_t anticipatedNumberOfTimers)
     {
-        // TODO - protect
+        mTimerHandleToTimeoutTimeMap.reserve(anticipatedNumberOfTimers);
+    }
+
+    static inline void run()
+    {
         mThread = std::thread(timerThreadLoop);
     }
 
-    static inline TimerScheduler::TimerHandle addTimer(const std::chrono::milliseconds& period, std::function<void()> callback)
+    static inline TimerScheduler::TimerHandle addTimer(const std::chrono::milliseconds& period, TimerScheduler::TimerCallback callback)
     {
-        MapKeyType timeoutTime = std::chrono::steady_clock::now() + period;
-        MapValue value;
-        value.callback = callback;
-        value.period = period;
+        // Compute timeout immediately (before locking mutex)
+        TimeoutTime timeoutTime = std::chrono::steady_clock::now() + period;
+
+        bool needToWakeThread(false);
+
+        Timer timer;
+        timer.callback = callback;
+        timer.period = period;
 
         {
-            SpinLock lock(mTimerMapLock);
-            value.handle = mNextAvailableHandle++;
-            auto iter = mTimers.insert(MapPairType(timeoutTime, value));
-            if(iter == mTimers.begin()) {
-                // wake up thread to adjust timeout
-                mCondVar.notify_one();
+            std::lock_guard<std::mutex> lock(mDataMutex);
+            // Find next available handle value
+            while(mTimerHandleToTimeoutTimeMap.count(mNextAvailableHandleHint) > 0)
+            {
+                ++mNextAvailableHandleHint;
+            }
+            timer.handle = mNextAvailableHandleHint;
+            ++mNextAvailableHandleHint; // Prepare for next use
+
+            mTimerHandleToTimeoutTimeMap[timer.handle] = timeoutTime;
+            auto iter = mTimeoutTimeToTimerMap.insert(TimeoutTimeToTimerMap::value_type(timeoutTime, timer));
+            if(iter == mTimeoutTimeToTimerMap.begin())
+            {
+                needToWakeThread = true;
             }
         }
 
-        return value.handle;
+        if(needToWakeThread)
+        {
+            // wake up thread to adjust timeout
+            mCondition.notify_one();
+        }
+
+        return timer.handle;
     }
 
     static void removeTimer(TimerScheduler::TimerHandle handle)
     {
-        bool needToWakeThread(true);
+        bool needToWakeThread(false);
 
         {
-            SpinLock lock(mTimerMapLock);
-            //  TODO - optimize this lookup with a hash table...
-            for(auto iter = mTimers.begin(); iter != mTimers.end(); iter++) {
-                if(iter->second.handle == handle) {
-                    if(iter != mTimers.begin()) {
-                        needToWakeThread = false;
+            std::lock_guard<std::mutex> lock(mDataMutex);
+
+            if(mTimerHandleToTimeoutTimeMap.count(handle) > 0)
+            {
+                // Use the reverse mapping to get the timeout time. Iterate over the equal keys
+                // to find the one with the right handle.
+                const TimeoutTime& timeoutTime = mTimerHandleToTimeoutTimeMap[handle];
+                const auto range = mTimeoutTimeToTimerMap.equal_range(timeoutTime);
+                for(auto iter = range.first; iter != range.second; iter++)
+                {
+                    if(iter->second.handle == handle)
+                    {
+                        if(iter == mTimeoutTimeToTimerMap.begin())
+                        {
+                            needToWakeThread = true;
+                        }
+
+                        mTimeoutTimeToTimerMap.erase(iter);
+                        break;
                     }
-                    mTimers.erase(iter);
-                    break;
                 }
             }
         }
 
-        if(needToWakeThread) {
+        if(needToWakeThread)
+        {
             // wake up thread to adjust timeout
-            mCondVar.notify_one();
+            mCondition.notify_one();
         }
     }
 
@@ -94,42 +130,53 @@ private:
     static void checkForTimeouts();
     static void waitForNextTimeout();
 
-    struct MapValue
+    struct Timer
     {
         TimerScheduler::TimerHandle handle;
-        std::function<void()> callback;
+        TimerScheduler::TimerCallback callback;
         std::chrono::milliseconds period;
     };
 
-    using MapKeyType = std::chrono::steady_clock::time_point;
-    using MapPairType = std::pair<MapKeyType, MapValue>;
+    using TimeoutTime = std::chrono::steady_clock::time_point;
+    using TimeoutTimeToTimerMap = std::multimap<TimeoutTime, Timer>;
+    using TimerHandleToTimeoutTimeMap = std::unordered_map<TimerScheduler::TimerHandle, TimeoutTime>;
 
-    static std::multimap<MapKeyType, MapValue> mTimers;
-    static std::atomic_flag mTimerMapLock;
-
-    static TimerScheduler::TimerHandle mNextAvailableHandle;
+    // Timer data:
+    // Multimap for TimeoutTime -> Timer object
+    static TimeoutTimeToTimerMap mTimeoutTimeToTimerMap;
+    // Hash table for reverse lookup of TimerHandle -> TimeoutTime, for timer removal
+    static TimerHandleToTimeoutTimeMap mTimerHandleToTimeoutTimeMap;
+    // Hint for next available handle value (could be in use, so must check first)
+    static TimerScheduler::TimerHandle mNextAvailableHandleHint;
+    // Mutex to protect all of the aforementioned data from concurrent access
+    static std::mutex mDataMutex;
 
     static std::thread mThread;
 
-    static std::mutex mMutex;
-
-    static std::condition_variable mCondVar;
+    static std::condition_variable mCondition;
+    static std::mutex mConditionMutex;
 };
 
-std::multimap<TimerSchedulerImpl::MapKeyType, TimerSchedulerImpl::MapValue> TimerSchedulerImpl::mTimers;
-std::atomic_flag TimerSchedulerImpl::mTimerMapLock{ATOMIC_FLAG_INIT};
-TimerScheduler::TimerHandle TimerSchedulerImpl::mNextAvailableHandle{1};
+std::multimap<TimerSchedulerImpl::TimeoutTime, TimerSchedulerImpl::Timer> TimerSchedulerImpl::mTimeoutTimeToTimerMap;
+std::unordered_map<TimerScheduler::TimerHandle, TimerSchedulerImpl::TimeoutTime> TimerSchedulerImpl::mTimerHandleToTimeoutTimeMap;
+std::mutex TimerSchedulerImpl::mDataMutex;
+TimerScheduler::TimerHandle TimerSchedulerImpl::mNextAvailableHandleHint{1};
 std::thread TimerSchedulerImpl::mThread;
-std::mutex TimerSchedulerImpl::mMutex;
-std::condition_variable TimerSchedulerImpl::mCondVar;
+std::condition_variable TimerSchedulerImpl::mCondition;
+std::mutex TimerSchedulerImpl::mConditionMutex;
 
 
-void TimerScheduler::start()
+void TimerScheduler::reserve(size_t anticipatedNumberOfTimers)
 {
-    TimerSchedulerImpl::start();
+    TimerSchedulerImpl::reserve(anticipatedNumberOfTimers);
 }
 
-TimerScheduler::TimerHandle TimerScheduler::addTimer(const std::chrono::milliseconds& period, std::function<void()> callback)
+void TimerScheduler::run()
+{
+    TimerSchedulerImpl::run();
+}
+
+TimerScheduler::TimerHandle TimerScheduler::addTimer(const std::chrono::milliseconds& period, TimerCallback callback)
 {
     return TimerSchedulerImpl::addTimer(period, callback);
 }
@@ -152,57 +199,64 @@ void TimerSchedulerImpl::timerThreadLoop()
 
 void TimerSchedulerImpl::checkForTimeouts()
 {
-    const auto now = std::chrono::steady_clock::now();
-
     // check for timeouts
-    std::vector<MapValue> timedOutTimers;
+    std::vector<Timer> timedOutTimers;
     {
-        SpinLock lock(mTimerMapLock);
-        auto iterFirst = mTimers.begin();
+        std::lock_guard<std::mutex> lock(mDataMutex);
+
+        const auto now = std::chrono::steady_clock::now(); // get time AFTER mutex has been locked
+        const auto iterFirst = mTimeoutTimeToTimerMap.begin();
         auto iter = iterFirst;
-        for(; iter != mTimers.end(); iter++) {
-            if(iter->first <= now) {
+        for(; iter != mTimeoutTimeToTimerMap.end(); iter++)
+        {
+            if(iter->first <= now)
+            {
                 timedOutTimers.push_back(iter->second);
             }
-            else {
+            else
+            {
                 break;
             }
         }
-        if(timedOutTimers.size() > 0) {
-            mTimers.erase(iterFirst, iter);
+        if(timedOutTimers.size() > 0)
+        {
+            mTimeoutTimeToTimerMap.erase(iterFirst, iter);
         }
 
         // re-insert timed out timers, reusing their handle
-        for(const auto& mapValue : timedOutTimers) {
-            MapKeyType timeoutTime = now + mapValue.period;
-            mTimers.insert(MapPairType(timeoutTime, mapValue));
+        for(const auto& timer : timedOutTimers)
+        {
+            TimeoutTime timeoutTime = now + timer.period;
+            mTimeoutTimeToTimerMap.insert(TimeoutTimeToTimerMap::value_type(timeoutTime, timer));
+            mTimerHandleToTimeoutTimeMap[timer.handle] = timeoutTime; // update the reverse mapping
         }
     }
 
     // call the callbacks
-    for(const auto& mapValue : timedOutTimers) {
-        mapValue.callback();
+    for(const auto& timer : timedOutTimers)
+    {
+        timer.callback(timer.handle);
     }
 }
 
 void TimerSchedulerImpl::waitForNextTimeout()
 {
     // get next wakeup time
-    MapKeyType nextTimeout;
+    TimeoutTime nextTimeoutTime;
     {
-        SpinLock lock(mTimerMapLock);
-        if(mTimers.size() > 0)
+        std::lock_guard<std::mutex> lock(mDataMutex);
+        if(mTimeoutTimeToTimerMap.size() > 0)
         {
-            nextTimeout = mTimers.begin()->first;
+            nextTimeoutTime = mTimeoutTimeToTimerMap.begin()->first;
         }
         else
         {
             // If there are no timers, set to 10s. Will wake and reevaluate if a timer is scheduled.
-            nextTimeout = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            nextTimeoutTime = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         }
     }
 
     // wait for timeout to happen
-    std::unique_lock<std::mutex> lock(mMutex);
-    mCondVar.wait_until(lock, nextTimeout);
+    std::unique_lock<std::mutex> lock(mConditionMutex);
+    mCondition.wait_until(lock, nextTimeoutTime);
 }

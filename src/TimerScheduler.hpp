@@ -1,5 +1,5 @@
 /**
- * MIT License
+ * The MIT License (MIT)
  *
  * Copyright (c) 2019 Ben Horowitz
  *
@@ -18,27 +18,37 @@
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
  * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
  */
 #pragma once
 
-#include <atomic>
+#include <chrono>
+#include <functional>
+#include <cstdint>
 
-class SpinLock
+class TimerScheduler
 {
-public:
-    SpinLock(std::atomic_flag& flag) :
-    	mFlag(flag)
-    {
-        while(mFlag.test_and_set(std::memory_order_acquire)) { /* spin */ }
-    }
-
-    ~SpinLock()
-    {
-        mFlag.clear(std::memory_order_release);
-    }
-
 private:
-	std::atomic_flag& mFlag;
+    TimerScheduler() = delete;
+    TimerScheduler(const TimerScheduler&) = delete;
+    TimerScheduler& operator=(const TimerScheduler &) = delete;
+    TimerScheduler(TimerScheduler &&) = delete;
+    TimerScheduler & operator=(TimerScheduler &&) = delete;
+
+public:
+    using TimerHandle = int32_t;
+    using TimerCallback = std::function<void(TimerHandle handle)>;
+
+    // Not thread safe- call once, before call to start()
+    static void reserve(size_t anticipatedNumberOfTimers);
+
+    // Call once to kick off the process
+    static void run();
+
+    // Add a timer
+    static TimerHandle addTimer(const std::chrono::milliseconds& period, TimerCallback callback);
+
+    // Remove a timer
+    static void removeTimer(TimerHandle handle);
 };
