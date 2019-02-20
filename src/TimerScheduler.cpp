@@ -21,7 +21,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
-#include "TimerScheduler.h"
+#include "TimerScheduler.hpp"
 
 #include <chrono>
 #include <functional>
@@ -63,7 +63,7 @@ public:
         timer.period = period;
 
         {
-            std::lock_guard<std::mutex> lock(mDataMutex);
+            std::lock_guard<std::mutex> lock(mMutex);
             // Find next available handle value
             while(mTimerHandleToTimeoutTimeMap.count(mNextAvailableHandleHint) > 0)
             {
@@ -94,7 +94,7 @@ public:
         bool needToWakeThread(false);
 
         {
-            std::lock_guard<std::mutex> lock(mDataMutex);
+            std::lock_guard<std::mutex> lock(mMutex);
 
             if(mTimerHandleToTimeoutTimeMap.count(handle) > 0)
             {
@@ -148,22 +148,20 @@ private:
     static TimerHandleToTimeoutTimeMap mTimerHandleToTimeoutTimeMap;
     // Hint for next available handle value (could be in use, so must check first)
     static TimerScheduler::TimerHandle mNextAvailableHandleHint;
-    // Mutex to protect all of the aforementioned data from concurrent access
-    static std::mutex mDataMutex;
-
-    static std::thread mThread;
 
     static std::condition_variable mCondition;
-    static std::mutex mConditionMutex;
+
+    static std::mutex mMutex;
+
+    static std::thread mThread;
 };
 
 std::multimap<TimerSchedulerImpl::TimeoutTime, TimerSchedulerImpl::Timer> TimerSchedulerImpl::mTimeoutTimeToTimerMap;
 std::unordered_map<TimerScheduler::TimerHandle, TimerSchedulerImpl::TimeoutTime> TimerSchedulerImpl::mTimerHandleToTimeoutTimeMap;
-std::mutex TimerSchedulerImpl::mDataMutex;
 TimerScheduler::TimerHandle TimerSchedulerImpl::mNextAvailableHandleHint{1};
-std::thread TimerSchedulerImpl::mThread;
 std::condition_variable TimerSchedulerImpl::mCondition;
-std::mutex TimerSchedulerImpl::mConditionMutex;
+std::mutex TimerSchedulerImpl::mMutex;
+std::thread TimerSchedulerImpl::mThread;
 
 
 void TimerScheduler::reserve(size_t anticipatedNumberOfTimers)
@@ -202,7 +200,7 @@ void TimerSchedulerImpl::checkForTimeouts()
     // check for timeouts
     std::vector<Timer> timedOutTimers;
     {
-        std::lock_guard<std::mutex> lock(mDataMutex);
+        std::lock_guard<std::mutex> lock(mMutex);
 
         const auto now = std::chrono::steady_clock::now(); // get time AFTER mutex has been locked
         const auto iterFirst = mTimeoutTimeToTimerMap.begin();
@@ -241,22 +239,15 @@ void TimerSchedulerImpl::checkForTimeouts()
 
 void TimerSchedulerImpl::waitForNextTimeout()
 {
-    // get next wakeup time
-    TimeoutTime nextTimeoutTime;
+    std::unique_lock<std::mutex> lock(mMutex);
+    if(mTimeoutTimeToTimerMap.size() > 0)
     {
-        std::lock_guard<std::mutex> lock(mDataMutex);
-        if(mTimeoutTimeToTimerMap.size() > 0)
-        {
-            nextTimeoutTime = mTimeoutTimeToTimerMap.begin()->first;
-        }
-        else
-        {
-            // If there are no timers, set to 10s. Will wake and reevaluate if a timer is scheduled.
-            nextTimeoutTime = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        }
+        // wait for next timeout to happen
+        mCondition.wait_until(lock, mTimeoutTimeToTimerMap.begin()->first);
     }
-
-    // wait for timeout to happen
-    std::unique_lock<std::mutex> lock(mConditionMutex);
-    mCondition.wait_until(lock, nextTimeoutTime);
+    else
+    {
+        // If there are no timers, wait indefinitely (will wake up and reevaluate if a timer is scheduled).
+        mCondition.wait(lock);
+    }
 }
