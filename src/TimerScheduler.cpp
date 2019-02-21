@@ -43,12 +43,45 @@ public:
 
     static inline void reserve(size_t anticipatedNumberOfTimers)
     {
-        mTimerHandleToTimeoutTimeMap.reserve(anticipatedNumberOfTimers);
+        std::lock_guard<std::mutex> lock(mMutex);
+        if(mState == State::Off)
+        {
+            mTimerHandleToTimeoutTimeMap.reserve(anticipatedNumberOfTimers);
+        }
     }
 
     static inline void run()
     {
-        mThread = std::thread(timerThreadLoop);
+        std::lock_guard<std::mutex> lock(mMutex);
+        if(mState == State::Off)
+        {
+            mThread = std::thread(timerThreadLoop);
+            mState = State::Running;
+        }
+    }
+
+    static inline void reset()
+    {
+        std::unique_lock<std::mutex> lock(mMutex);
+        if(mState == State::Running)
+        {
+            // This method can only work from another thread
+            if(std::this_thread::get_id() != mThread.get_id())
+            {
+                // wake up the thread (will still be blocked by mutex until after the new state is set below)
+                mCondition.notify_one();
+                mState = State::Stopping; // transition to Stopping state; signals thread to stop
+                lock.unlock();
+
+                // Unlock the lock and wait for the thread to finish
+                mThread.join();
+
+                lock.lock();
+                mTimeoutTimeToTimerMap.clear();
+                mTimerHandleToTimeoutTimeMap.clear();
+                mState = State::Off; // transition to Off state
+            }
+        }
     }
 
     static inline TimerScheduler::TimerHandle addTimer(const std::chrono::milliseconds& period, TimerScheduler::TimerCallback callback)
@@ -61,22 +94,28 @@ public:
         Timer timer;
         timer.callback = callback;
         timer.period = period;
+        timer.handle = 0;
 
         {
             std::lock_guard<std::mutex> lock(mMutex);
-            // Find next available handle value
-            while(mTimerHandleToTimeoutTimeMap.count(mNextAvailableHandleHint) > 0)
-            {
-                ++mNextAvailableHandleHint;
-            }
-            timer.handle = mNextAvailableHandleHint;
-            ++mNextAvailableHandleHint; // Prepare for next use
 
-            mTimerHandleToTimeoutTimeMap[timer.handle] = timeoutTime;
-            auto iter = mTimeoutTimeToTimerMap.insert(TimeoutTimeToTimerMap::value_type(timeoutTime, timer));
-            if(iter == mTimeoutTimeToTimerMap.begin())
+            if(mState == State::Running)
             {
-                needToWakeThread = true;
+                // Find next available handle value
+                while(mTimerHandleToTimeoutTimeMap.count(mNextAvailableHandleHint) > 0)
+                {
+                    ++mNextAvailableHandleHint;
+                }
+                timer.handle = mNextAvailableHandleHint;
+                ++mNextAvailableHandleHint; // Prepare for next use
+
+                // Add timer to maps
+                mTimerHandleToTimeoutTimeMap[timer.handle] = timeoutTime;
+                auto iter = mTimeoutTimeToTimerMap.insert(TimeoutTimeToTimerMap::value_type(timeoutTime, timer));
+                if(iter == mTimeoutTimeToTimerMap.begin())
+                {
+                    needToWakeThread = true;
+                }
             }
         }
 
@@ -96,23 +135,26 @@ public:
         {
             std::lock_guard<std::mutex> lock(mMutex);
 
-            if(mTimerHandleToTimeoutTimeMap.count(handle) > 0)
+            if(mState == State::Running)
             {
-                // Use the reverse mapping to get the timeout time. Iterate over the equal keys
-                // to find the one with the right handle.
-                const TimeoutTime& timeoutTime = mTimerHandleToTimeoutTimeMap[handle];
-                const auto range = mTimeoutTimeToTimerMap.equal_range(timeoutTime);
-                for(auto iter = range.first; iter != range.second; iter++)
+                if(mTimerHandleToTimeoutTimeMap.count(handle) > 0)
                 {
-                    if(iter->second.handle == handle)
+                    // Use the reverse mapping to get the timeout time. Iterate over the equal keys
+                    // to find the one with the right handle.
+                    const TimeoutTime& timeoutTime = mTimerHandleToTimeoutTimeMap[handle];
+                    const auto range = mTimeoutTimeToTimerMap.equal_range(timeoutTime);
+                    for(auto iter = range.first; iter != range.second; iter++)
                     {
-                        if(iter == mTimeoutTimeToTimerMap.begin())
+                        if(iter->second.handle == handle)
                         {
-                            needToWakeThread = true;
-                        }
+                            if(iter == mTimeoutTimeToTimerMap.begin())
+                            {
+                                needToWakeThread = true;
+                            }
 
-                        mTimeoutTimeToTimerMap.erase(iter);
-                        break;
+                            mTimeoutTimeToTimerMap.erase(iter);
+                            break;
+                        }
                     }
                 }
             }
@@ -127,8 +169,17 @@ public:
 
 private:
     static void timerThreadLoop();
-    static void checkForTimeouts();
-    static void waitForNextTimeout();
+    // Returns false if thread should be stopped
+    static bool checkForTimeouts();
+    // Returns false if thread should be stopped
+    static bool waitForNextTimeout();
+
+    enum class State
+    {
+        Off,
+        Running,
+        Stopping
+    };
 
     struct Timer
     {
@@ -154,6 +205,8 @@ private:
     static std::mutex mMutex;
 
     static std::thread mThread;
+
+    static State mState;
 };
 
 std::multimap<TimerSchedulerImpl::TimeoutTime, TimerSchedulerImpl::Timer> TimerSchedulerImpl::mTimeoutTimeToTimerMap;
@@ -162,6 +215,7 @@ TimerScheduler::TimerHandle TimerSchedulerImpl::mNextAvailableHandleHint{1};
 std::condition_variable TimerSchedulerImpl::mCondition;
 std::mutex TimerSchedulerImpl::mMutex;
 std::thread TimerSchedulerImpl::mThread;
+TimerSchedulerImpl::State TimerSchedulerImpl::mState{TimerSchedulerImpl::State::Off};
 
 
 void TimerScheduler::reserve(size_t anticipatedNumberOfTimers)
@@ -172,6 +226,11 @@ void TimerScheduler::reserve(size_t anticipatedNumberOfTimers)
 void TimerScheduler::run()
 {
     TimerSchedulerImpl::run();
+}
+
+void TimerScheduler::reset()
+{
+    TimerSchedulerImpl::reset();
 }
 
 TimerScheduler::TimerHandle TimerScheduler::addTimer(const std::chrono::milliseconds& period, TimerCallback callback)
@@ -189,18 +248,26 @@ void TimerSchedulerImpl::timerThreadLoop()
 {
     while(1)
     {
-        checkForTimeouts();
-
-        waitForNextTimeout();
+        // If either step indicates that loop should stop, break out
+        if(!checkForTimeouts() || !waitForNextTimeout())
+        {
+            break;
+        }
     }
 }
 
-void TimerSchedulerImpl::checkForTimeouts()
+bool TimerSchedulerImpl::checkForTimeouts()
 {
     // check for timeouts
     std::vector<Timer> timedOutTimers;
     {
         std::lock_guard<std::mutex> lock(mMutex);
+
+        // If should not be running, indicate to thread loop that it is time to stop
+        if(mState != State::Running)
+        {
+            return false;
+        }
 
         const auto now = std::chrono::steady_clock::now(); // get time AFTER mutex has been locked
         const auto iterFirst = mTimeoutTimeToTimerMap.begin();
@@ -235,11 +302,20 @@ void TimerSchedulerImpl::checkForTimeouts()
     {
         timer.callback(timer.handle);
     }
+
+    return true;
 }
 
-void TimerSchedulerImpl::waitForNextTimeout()
+bool TimerSchedulerImpl::waitForNextTimeout()
 {
     std::unique_lock<std::mutex> lock(mMutex);
+
+    // If should not be running, indicate to thread loop that it is time to stop
+    if(mState != State::Running)
+    {
+        return false;
+    }
+
     if(mTimeoutTimeToTimerMap.size() > 0)
     {
         // wait for next timeout to happen
@@ -250,4 +326,6 @@ void TimerSchedulerImpl::waitForNextTimeout()
         // If there are no timers, wait indefinitely (will wake up and reevaluate if a timer is scheduled).
         mCondition.wait(lock);
     }
+
+    return true;
 }

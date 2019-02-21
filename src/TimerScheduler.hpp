@@ -29,22 +29,26 @@
 
 class TimerScheduler
 {
-private:
+public:
     TimerScheduler() = delete;
     TimerScheduler(const TimerScheduler&) = delete;
     TimerScheduler& operator=(const TimerScheduler &) = delete;
     TimerScheduler(TimerScheduler &&) = delete;
     TimerScheduler & operator=(TimerScheduler &&) = delete;
 
-public:
     using TimerHandle = int32_t;
     using TimerCallback = std::function<void(TimerHandle handle)>;
 
-    // Not thread safe- call once, before call to start()
+    // Call to set allocation for timer data storage; only has an affect if not the scheduler is not running.
     static void reserve(size_t anticipatedNumberOfTimers);
 
-    // Call once to kick off the process
+    // Call to start the scheduler.
     static void run();
+
+    // Call to stop the scheduler. This will also remove all timers.
+    // This must be called from a thread context other than the scheduler (if this is called from
+    // within a timeout callback it will have no affect).
+    static void reset();
 
     // Add a timer
     static TimerHandle addTimer(const std::chrono::milliseconds& period, TimerCallback callback);
